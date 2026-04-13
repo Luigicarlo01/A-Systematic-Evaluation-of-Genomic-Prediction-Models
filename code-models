@@ -1,0 +1,889 @@
+import pandas as pd
+import os
+
+BASE_PATH = "/content/"
+
+# Load the datasets
+X_train_path = os.path.join(BASE_PATH, "X_train.csv")
+X_val_path = os.path.join(BASE_PATH, "X_val.csv")
+
+X_train_df = pd.read_csv(X_train_path)
+X_val_df = pd.read_csv(X_val_path)
+
+print("Original X_train_df shape:", X_train_df.shape)
+print("Original X_val_df shape:", X_val_df.shape)
+
+# Remove the first two columns
+# Using .iloc to select columns from index 2 onwards
+X_train_df_modified = X_train_df.iloc[:, 2:]
+X_val_df_modified = X_val_df.iloc[:, 2:]
+
+print("Modified X_train_df shape:", X_train_df_modified.shape)
+print("Modified X_val_df shape:", X_val_df_modified.shape)
+
+# Save the modified DataFrames back to CSV, overwriting the original files
+X_train_df_modified.to_csv(X_train_path, index=False)
+X_val_df_modified.to_csv(X_val_path, index=False)
+
+print(f"Successfully removed the first two columns from X_train.csv and X_val.csv, and saved them to {BASE_PATH}.")
+
+
+# ===============================================================
+# PIPELINE COMPLETO - 38 MODELOS (RKHS-RBF/AD/ADE)
+# ATUALIZAÇÃO: NORMALIZAÇÃO de Y (Média 0, Variância 1)
+# ATUALIZAÇÃO: RMSE CALCULADO COM DADOS NORMALIZADOS (SRMSE)
+# ===============================================================
+
+# Instalações
+!pip install lightgbm catboost xgboost scikit-learn tensorflow -q
+
+# Imports
+import os, time
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import warnings
+warnings.filterwarnings("ignore")
+
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+
+from sklearn.linear_model import RidgeCV, LinearRegression
+from sklearn.linear_model import BayesianRidge, ElasticNetCV, LassoCV
+from sklearn.ensemble import RandomForestRegressor, ExtraTreesRegressor, GradientBoostingRegressor, StackingRegressor
+from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.svm import SVR, LinearSVR
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.decomposition import PCA
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import RBF, WhiteKernel
+from sklearn.metrics import mean_squared_error
+from sklearn.preprocessing import StandardScaler
+from scipy.stats import pearsonr
+from sklearn.kernel_ridge import KernelRidge
+from sklearn.impute import SimpleImputer
+from sklearn.metrics.pairwise import pairwise_distances
+
+from lightgbm import LGBMRegressor
+from catboost import CatBoostRegressor
+import xgboost as xgb
+
+# Global params
+BASE_PATH = "/content/"
+PLOTS_DIR = "training_history_plots" # Pasta para salvar os gráficos no /content/
+MAF_THRESHOLD = 0.05
+EPOCHS = 150
+BATCH_SIZE = 64
+RANDOM_SEED = 42
+N_BOOTSTRAPS = 1000
+tf.keras.utils.set_random_seed(RANDOM_SEED)
+np.random.seed(RANDOM_SEED)
+
+# Cria a pasta para salvar os gráficos
+if not os.path.exists(PLOTS_DIR):
+    os.makedirs(PLOTS_DIR)
+    print(f"Pasta '{PLOTS_DIR}' criada para salvar os gráficos de treino.")
+
+# Lista de modelos
+MODEL_NAMES = [
+ 'RKHS-RBF','RKHS-AD','RKHS-ADE','Bayesian Ridge','Elastic Net','LassoCV','Linear Regression',
+ 'SVM-RBF','SVM-Poly','KNN','Random Forest','Extra Trees',
+ 'LightGBM','CatBoost','XGBoost','HistGradientBoosting','GradientBoosting',
+ 'DNN','CNN',
+ 'DeepGS','DGSN','Epistatic Net (EN)',
+ 'Stacking','LGBM+NN','MLP L1/L2','AttentionNet',
+ 'LassoBayes','SVR-L1','DNN-L1','CNN-L1',
+ 'DNN-L1L2','CNN-L1L2',
+]
+
+results = {}
+
+# Variáveis para normalização de Y (Definidas após o carregamento dos dados)
+Y_scaler = None
+
+# -------------------------
+# Helper: Plotagem do Histórico de Treinamento
+# -------------------------
+def plot_training_history(history, model_name, plots_dir):
+    plt.figure(figsize=(12, 5))
+
+    # Plot Loss
+    plt.subplot(1, 2, 1)
+    plt.plot(history.history['loss'], label='Treino Loss')
+    if 'val_loss' in history.history:
+        plt.plot(history.history['val_loss'], label='Validação Loss')
+    plt.title(f'Loss do Modelo: {model_name}')
+    plt.ylabel('Loss (MSE)')
+    plt.xlabel('Época')
+    plt.legend(loc='upper right')
+    plt.grid(True)
+
+    # Plot Metric (RMSE)
+    plt.subplot(1, 2, 2)
+    # A métrica é 'root_mean_squared_error' se for usada no compile
+    metric_key = 'root_mean_squared_error' if 'root_mean_squared_error' in history.history else 'loss' # Fallback
+    val_metric_key = 'val_root_mean_squared_error' if 'val_root_mean_squared_error' in history.history else 'val_loss' # Fallback
+
+    plt.plot(history.history[metric_key], label=f'Treino {metric_key}')
+    if val_metric_key in history.history:
+        plt.plot(history.history[val_metric_key], label=f'Validação {metric_key}')
+    plt.title(f'Métrica do Modelo: {model_name}')
+    plt.ylabel('RMSE (Normalizado)')
+    plt.xlabel('Época')
+    plt.legend(loc='upper right')
+    plt.grid(True)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(plots_dir, f'{model_name}_training_history.png'))
+    plt.close()
+    print(f"Gráfico de histórico de treino salvo para {model_name}.")
+
+# -------------------------
+# Helper: NDCG
+# -------------------------
+def ndcg_score(y_true, y_pred, k=None):
+    """Calcula o NDCG para uma lista de predições e valores verdadeiros."""
+    y_true = np.asarray(y_true).flatten()
+    y_pred = np.asarray(y_pred).flatten()
+
+    if k is None:
+        k = len(y_true)
+
+    desc_rank_idx = np.argsort(y_pred)[::-1][:k]
+    ranked_true = y_true[desc_rank_idx]
+
+    discounts = np.log2(np.arange(2, len(ranked_true) + 2))
+    dcg = np.sum(ranked_true / discounts)
+
+    ideal_ranked_true = np.sort(y_true)[::-1][:k]
+    idcg = np.sum(ideal_ranked_true / discounts)
+
+    return dcg / idcg if idcg > 0 else 0.0
+
+# -------------------------
+# Helper: evaluation (AGORA CALCULA SRMSE E OUTRAS MÉTRICAS NA ESCALA ORIGINAL)
+# -------------------------
+def evaluate_and_store(name, y_pred_norm, y_true_norm, start_time, y_true_original, y_scaler):
+    duration = time.time() - start_time
+
+    # Desnormalização para métricas de seleção/interpretabilidade prática (Acc, HitRate, NDCG)
+    y_pred_orig = y_scaler.inverse_transform(y_pred_norm.reshape(-1, 1)).flatten()
+    y_true_orig = y_true_original
+
+    n_samples = len(y_true_orig)
+
+    # Checagem de NaNs
+    if np.isnan(y_pred_orig).any() or np.isnan(y_true_orig).any() or n_samples == 0:
+        print(f"❌ {name} — Contém NaNs ou dados vazios, pulando bootstrap.")
+        error_metrics = {k: np.nan for k in ['Acurácia', 'Acurácia_std', 'Viés (b)', 'Viés (b)_std', 'RMSE', 'RMSE_std', 'RMSE (10% Melhores)', 'RMSE (10% Melhores)_std', 'Top10 Predito (média real)', 'Top10 Predito (média real)_std', 'Hit Rate (10% Coinc.)', 'Hit Rate (10% Coinc.)_std', 'NDCG', 'NDCG_std', 'Viés^2 (Boot)', 'Variância (Boot)']}
+        results[name] = {**error_metrics, 'Tempo (s)': float(duration), 'y_pred': y_pred_orig}
+        return
+
+    # Listas para armazenar resultados do bootstrap
+    boot_accs = []; boot_rmses = []; boot_biases = []
+    boot_rmse_top10s = []; boot_mean_tops = []; boot_hit_rates = []; boot_ndcgs = []
+    all_boot_predictions_norm = []
+
+    # Loop de Bootstrap
+    for _ in range(N_BOOTSTRAPS):
+        try:
+            # Reamostra com reposição
+            boot_idx = np.random.choice(n_samples, size=n_samples, replace=True)
+
+            # Amostras ORIGINAIS (para Acc, Viés, HitRate, Top10, NDCG)
+            y_true_orig_boot = y_true_orig[boot_idx]
+            y_pred_orig_boot = y_pred_orig[boot_idx]
+
+            # Amostras NORMALIZADAS (PARA SRMSE)
+            y_true_norm_boot = y_true_norm[boot_idx]
+            y_pred_norm_boot = y_pred_norm[boot_idx]
+
+            # 1. Pearson (accuracy) - Usa dados ORIGINAIS
+            if np.std(y_pred_orig_boot) > 1e-6 and np.std(y_true_orig_boot) > 1e-6:
+                acc = pearsonr(y_pred_orig_boot, y_true_orig_boot)[0]
+                boot_accs.append(acc)
+
+            # RMSE (SRMSE) - Usa dados NORMALIZADOS
+            rmse = np.sqrt(mean_squared_error(y_true_norm_boot, y_pred_norm_boot))
+            boot_rmses.append(rmse)
+
+            # Calibração: Viés (b) - Usa dados ORIGINAIS
+            if np.std(y_pred_orig_boot) > 1e-6:
+                bias_b = LinearRegression().fit(y_pred_orig_boot.reshape(-1,1), y_true_orig_boot.reshape(-1,1)).coef_[0][0]
+                boot_biases.append(bias_b)
+
+            # 2. RMSE top 10% reais (SRMSE top 10%) - Usa dados NORMALIZADOS, mas o índice é baseado no ranking ORIGINAL
+            limiar_true_orig_boot = np.percentile(y_true_orig_boot, 90)
+            idx_top_real_orig_boot = np.where(y_true_orig_boot >= limiar_true_orig_boot)[0]
+
+            if len(idx_top_real_orig_boot) > 1:
+                rmse_top10 = np.sqrt(mean_squared_error(y_true_norm_boot[idx_top_real_orig_boot], y_pred_norm_boot[idx_top_real_orig_boot]))
+                boot_rmse_top10s.append(rmse_top10)
+
+            # 3. Média verdadeira dos top10 preditos - Usa dados ORIGINAIS
+            lim_pred_orig_boot = np.percentile(y_pred_orig_boot, 90)
+            idx_top_pred_orig_boot = np.where(y_pred_orig_boot >= lim_pred_orig_boot)[0]
+            if len(idx_top_pred_orig_boot) > 0:
+                mean_top_pred_real = y_true_orig_boot[idx_top_pred_orig_boot].mean()
+                boot_mean_tops.append(mean_top_pred_real)
+
+            # 4. Taxa de Coincidência (Hit Rate) - Usa índices ORIGINAIS
+            num_selected_boot = len(idx_top_pred_orig_boot)
+            num_top_real_boot = len(idx_top_real_orig_boot)
+            if num_selected_boot > 0 and num_top_real_boot > 0:
+                overlap = len(np.intersect1d(idx_top_pred_orig_boot, idx_top_real_orig_boot))
+                hit_rate = overlap / num_selected_boot
+                boot_hit_rates.append(hit_rate)
+            else:
+                boot_hit_rates.append(0.0)
+
+            # 5. NDCG - Usa dados ORIGINAIS
+            ndcg = ndcg_score(y_true_orig_boot, y_pred_orig_boot, k=int(n_samples*0.1))
+            boot_ndcgs.append(ndcg)
+
+            # Coletar predições de validação (NORMALIZADAS) para Viés/Variância
+            all_boot_predictions_norm.append(y_pred_norm_boot)
+
+        except Exception as e:
+            continue
+
+    # Calcula Média e Desvio Padrão
+    acc_mean, acc_std = (np.mean(boot_accs), np.std(boot_accs)) if boot_accs else (np.nan, np.nan)
+    rmse_mean, rmse_std = (np.mean(boot_rmses), np.std(boot_rmses)) if boot_rmses else (np.nan, np.nan)
+    bias_mean, bias_std = (np.mean(boot_biases), np.std(boot_biases)) if boot_biases else (np.nan, np.nan)
+    rmse10_mean, rmse10_std = (np.mean(boot_rmse_top10s), np.std(boot_rmse_top10s)) if boot_rmse_top10s else (np.nan, np.nan)
+    top10_mean, top10_std = (np.mean(boot_mean_tops), np.std(boot_mean_tops)) if boot_mean_tops else (np.nan, np.nan)
+    hr_mean, hr_std = (np.mean(boot_hit_rates), np.std(boot_hit_rates)) if boot_hit_rates else (np.nan, np.nan)
+    ndcg_mean, ndcg_std = (np.mean(boot_ndcgs), np.std(boot_ndcgs)) if boot_ndcgs else (np.nan, np.nan)
+
+    # 6. Estimação de Viés/Variância (usando as predições de bootstrap NORMALIZADAS)
+    if all_boot_predictions_norm:
+        # PRED: Média das predições de todas as iterações de bootstrap (Estimativa de E[f_hat(x)])
+        mean_preds = np.mean(all_boot_predictions_norm, axis=0)
+
+        # VARIÂNCIA: Média da variância das predições em cada ponto (Estimativa de E[(f_hat - E[f_hat])^2]) - Usando dados NORMALIZADOS
+        variance_boot = np.mean(np.var(all_boot_predictions_norm, axis=0))
+
+        # VIÉS^2: Média do viés quadrado em cada ponto (Estimativa de (E[f_hat] - f(x))^2) - Usando dados NORMALIZADOS
+        # Usamos o Y_true_norm (valor real NORMALIZADO) como f(x)
+        bias_squared_boot = np.mean((mean_preds - y_true_norm)**2)
+    else:
+        variance_boot = np.nan
+        bias_squared_boot = np.nan
+
+    # Armazena os resultados (agora RMSE é SRMSE)
+    results[name] = {
+        'Acurácia': float(acc_mean), 'Acurácia_std': float(acc_std),
+        'Viés (b)': float(bias_mean), 'Viés (b)_std': float(bias_std),
+        'RMSE': float(rmse_mean), 'RMSE_std': float(rmse_std),
+        'RMSE (10% Melhores)': float(rmse10_mean), 'RMSE (10% Melhores)_std': float(rmse10_std),
+        'Top10 Predito (média real)': float(top10_mean), 'Top10 Predito (média real)_std': float(top10_std),
+        'Hit Rate (10% Coinc.)': float(hr_mean), 'Hit Rate (10% Coinc.)_std': float(hr_std),
+        'NDCG': float(ndcg_mean), 'NDCG_std': float(ndcg_std),
+        'Viés^2 (Boot)': float(bias_squared_boot), # NOVO
+        'Variância (Boot)': float(variance_boot), # NOVO
+        'Tempo (s)': float(duration),
+        'y_pred': y_pred_orig # Armazena o desnormalizado para plots de dispersão
+    }
+
+    # Linha de impressão corrigida, incluindo Viés^2 e Variância
+    print(f"✅ {name} — Acc={acc_mean:.4f} (±{acc_std:.4f}), SRMSE(Norm)={rmse_mean:.4f} (±{rmse_std:.4f}), Viés²={bias_squared_boot:.4f}, Var={variance_boot:.4f}, Tempo={duration:.2f}s")
+
+# -------------------------
+# RKHS Helper: Cálculo do Kernel Gaussiano (RBF)
+# (Inalterada)
+# -------------------------
+def calculate_rbf_kernel(X_train, X_val, gamma=None):
+    if gamma is None:
+        gamma = 1.0 / X_train.shape[1]
+
+    dist_sq_train = pairwise_distances(X_train, metric='sqeuclidean')
+    K_train = np.exp(-gamma * dist_sq_train)
+
+    dist_sq_val = pairwise_distances(X_val, X_train, metric='sqeuclidean')
+    K_val = np.exp(-gamma * dist_sq_val)
+
+    return K_train, K_val
+
+# -------------------------
+# RKHS Model (KernelRidge)
+# -------------------------
+def run_rkhs_model(name, K_train, K_val, Y_train_norm, Y_val_norm, Y_val_orig, Y_scaler):
+    print(f"\n--- {name} ---")
+    start_time = time.time()
+    try:
+        model = KernelRidge(alpha=1.0, kernel='precomputed')
+        model.fit(K_train, Y_train_norm)
+        y_pred_norm = model.predict(K_val)
+        evaluate_and_store(name, y_pred_norm, Y_val_norm, start_time, Y_val_orig, Y_scaler)
+    except Exception as e:
+        print(f"❌ Erro ao treinar/avaliar {name}: {e}")
+        error_metrics = {k: np.nan for k in ['Acurácia', 'Acurácia_std', 'Viés (b)', 'Viés (b)_std', 'RMSE', 'RMSE_std', 'RMSE (10% Melhores)', 'RMSE (10% Melhores)_std', 'Top10 Predito (média real)', 'Top10 Predito (média real)_std', 'Hit Rate (10% Coinc.)', 'Hit Rate (10% Coinc.)_std', 'NDCG', 'NDCG_std']}
+        results[name] = {**error_metrics, 'Tempo (s)': time.time() - start_time, 'y_pred': np.full_like(Y_val_orig, np.nan)}
+
+# -------------------------
+# Cálculo das matrizes genômicas G, D e I
+# (Inalterada)
+# -------------------------
+def calculate_genomic_matrices(X_scaled, X_raw):
+    n_individuals, n_markers = X_scaled.shape
+    den_sum = np.sum(np.power(X_scaled.std(axis=0),2)) * n_individuals
+    den_sum = den_sum if den_sum != 0 else 1e-6
+    G = np.dot(X_scaled, X_scaled.T) / den_sum
+    p = X_raw.mean(axis=0)/2.0
+    q = 1-p
+    den_dom_val = 2*p*q
+    den_dom_val[den_dom_val==0] = 1e-6
+    W = np.zeros_like(X_raw)
+    W[X_raw==1] = 1
+    W_scaled = (W - den_dom_val)/np.sqrt(den_dom_val)
+    den_sum_dom = np.sum(den_dom_val)
+    den_sum_dom = den_sum_dom if den_sum_dom != 0 else 1e-6
+    D = np.dot(W_scaled, W_scaled.T)/den_sum_dom
+    I = G*G
+    return G, D, I, den_sum, den_dom_val, W_scaled
+
+# -------------------------
+# Cálculo das matrizes genômicas validação (Cross-Kernel)
+# (Inalterada)
+# -------------------------
+def calculate_validation_kernels(X_val_scaled, X_val_raw, X_train_scaled, den_sum, den_dom_val, W_train_scaled):
+    G_val = np.dot(X_val_scaled, X_train_scaled.T) / den_sum
+    W_val_raw = np.zeros_like(X_val_raw)
+    W_val_raw[X_val_raw==1] = 1
+    W_val_scaled = (W_val_raw - den_dom_val)/np.sqrt(den_dom_val)
+    D_val = np.dot(W_val_scaled, W_train_scaled.T)/np.sum(den_dom_val)
+    I_val = G_val*G_val
+    return G_val, D_val, I_val
+
+# -------------------------
+# Load data
+# -------------------------
+try:
+    X_train_df = pd.read_csv(os.path.join(BASE_PATH, "X_train.csv"))
+    X_val_df   = pd.read_csv(os.path.join(BASE_PATH, "X_val.csv"))
+    Y_train_orig = pd.read_csv(os.path.join(BASE_PATH, "Y_train.csv")).values.flatten().astype(np.float32)
+    Y_val_gv_orig = pd.read_csv(os.path.join(BASE_PATH, "Y_val_gv.csv")).values.flatten().astype(np.float32)
+    print("Dados carregados dos CSVs.")
+except Exception as e:
+    print("Aviso: arquivos não encontrados — gerando dados dummy para teste.")
+    n_train, n_val, n_markers_raw = 400, 100, 1000
+    X_train_df = pd.DataFrame(np.random.randint(0,3,size=(n_train,n_markers_raw)), columns=[f'M{i}' for i in range(n_markers_raw)])
+    X_val_df = pd.DataFrame(np.random.randint(0,3,size=(n_val,n_markers_raw)), columns=[f'M{i}' for i in range(n_markers_raw)])
+    Y_train_orig = np.random.rand(n_train).astype(np.float32)
+    Y_val_gv_orig = np.random.rand(n_val).astype(np.float32)
+
+# -------------------------
+# Preprocessing (Filtro MAF e Escalonamento dos X)
+# -------------------------
+# Filter by MAF
+freq_p = X_train_df.mean(axis=0) / 2.0
+maf = np.minimum(freq_p, 1 - freq_p)
+keep_markers = maf[maf >= MAF_THRESHOLD].index.tolist()
+
+X_train_df = X_train_df[keep_markers]
+X_val_df   = X_val_df[keep_markers]
+
+X_train_raw = X_train_df.values.astype(np.float32)
+X_val_raw = X_val_df.values.astype(np.float32)
+
+# StandardScaler para X
+print("Aplicando StandardScaler em X (SNP markers)...")
+scaler_X = StandardScaler()
+X_train_scaled = scaler_X.fit_transform(X_train_raw)
+X_val_scaled = scaler_X.transform(X_val_raw)
+
+n_markers = X_train_scaled.shape[1]
+print(f"Pré-processamento X pronto — marcadores: {n_markers}")
+
+# -------------------------
+# Normalização de Y (Resposta)
+# -------------------------
+print("Aplicando StandardScaler em Y (Valor Genético)...")
+Y_scaler = StandardScaler()
+Y_train_norm = Y_scaler.fit_transform(Y_train_orig.reshape(-1, 1)).flatten()
+Y_val_norm = Y_scaler.transform(Y_val_gv_orig.reshape(-1, 1)).flatten()
+
+# Arrays 3D (para CNN e DeepGS)
+X_train_3d = np.expand_dims(X_train_scaled, axis=2)
+X_val_3d   = np.expand_dims(X_val_scaled, axis=2)
+
+# Callbacks
+callbacks = [
+    EarlyStopping(monitor='val_loss', patience=15, restore_best_weights=True),
+    ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, min_lr=1e-6)
+]
+
+# GPU Check
+gpus = tf.config.list_physical_devices('GPU')
+if gpus:
+    print(f"GPU detectada: {len(gpus)}")
+else:
+    print("Nenhuma GPU detectada (rodando na CPU).")
+
+# -------------------------
+# FUNCTIONS: build Keras models (Compilando com loss='mse' para Y normalizado)
+# (As funções build_dnn, build_dnn_l1, etc., permanecem inalteradas, pois usam loss='mse')
+# -------------------------
+def get_adamw(lr=1e-3, wd=1e-5):
+    return keras.optimizers.Adam(learning_rate=lr)
+
+def build_dnn(input_dim):
+    model = keras.Sequential([
+        layers.Input(shape=(input_dim,)),
+        layers.Dense(512, activation='relu'), layers.Dropout(0.3),
+        layers.Dense(256, activation='relu'), layers.Dropout(0.3),
+        layers.Dense(64, activation='relu'),
+        layers.Dense(1, activation='linear')
+    ])
+    model.compile(optimizer=get_adamw(1e-3), loss='mse')
+    return model
+def build_dnn_l1(input_dim, l1_reg=1e-5):
+    model = keras.Sequential([
+        layers.Input(shape=(input_dim,)),
+        layers.Dense(512, activation='relu', kernel_regularizer=keras.regularizers.l1(l1_reg)),
+        layers.Dropout(0.3),
+        layers.Dense(256, activation='relu', kernel_regularizer=keras.regularizers.l1(l1_reg)),
+        layers.Dropout(0.3),
+        layers.Dense(64, activation='relu', kernel_regularizer=keras.regularizers.l1(l1_reg)),
+        layers.Dense(1, activation='linear')
+    ])
+    model.compile(optimizer=get_adamw(1e-3), loss='mse')
+    return model
+def build_dnn_l1l2(input_dim, l_reg=1e-5):
+    model = keras.Sequential([
+        layers.Input(shape=(input_dim,)),
+        layers.Dense(512, activation='relu', kernel_regularizer=keras.regularizers.l1_l2(l_reg, l_reg)),
+        layers.Dropout(0.3),
+        layers.Dense(256, activation='relu', kernel_regularizer=keras.regularizers.l1_l2(l_reg, l_reg)),
+        layers.Dropout(0.3),
+        layers.Dense(64, activation='relu', kernel_regularizer=keras.regularizers.l1_l2(l_reg, l_reg)),
+        layers.Dense(1, activation='linear')
+    ])
+    model.compile(optimizer=get_adamw(1e-3), loss='mse')
+    return model
+def build_mlp_l1l2(input_dim):
+    # Reduzindo a regularização e o dropout para maior estabilidade
+    model = keras.Sequential([
+        layers.Input(shape=(input_dim,)),
+        layers.Dense(256, activation='relu', kernel_regularizer=keras.regularizers.l1_l2(1e-6,1e-6)), # Regularização reduzida
+        layers.Dropout(0.1), # Dropout reduzido
+        layers.Dense(128, activation='relu', kernel_regularizer=keras.regularizers.l1_l2(1e-6,1e-6)), # Regularização reduzida
+        layers.Dropout(0.1), # Dropout reduzido
+        layers.Dense(1)
+    ])
+    model.compile(optimizer=get_adamw(5e-4), loss='mse')
+    return model
+def build_cnn(input_shape):
+    tf.keras.utils.set_random_seed(RANDOM_SEED)
+    # Ajustando a arquitetura para maior estabilidade e capacidade
+    model = keras.Sequential([
+        layers.Input(shape=input_shape),
+        layers.Conv1D(filters=64, kernel_size=5, activation='relu', padding='same'), # Filtros aumentados, kernel menor
+        layers.MaxPooling1D(pool_size=2),
+        layers.Dropout(0.1), # Dropout reduzido
+        layers.Conv1D(filters=32, kernel_size=3, activation='relu', padding='same'),
+        layers.MaxPooling1D(pool_size=2),
+        layers.Flatten(),
+        layers.Dense(64, activation='relu', kernel_regularizer=keras.regularizers.l2(0.001)), # Adicionando regularização L2
+        layers.Dropout(0.2),
+        layers.Dense(1, activation='linear')
+    ])
+    model.compile(optimizer=keras.optimizers.Adam(0.001), loss='mse')
+    return model
+def build_cnn_l1(input_shape, l1_reg=1e-5):
+    tf.keras.utils.set_random_seed(RANDOM_SEED)
+    model = keras.Sequential([
+        layers.Input(shape=input_shape),
+        layers.Conv1D(filters=32, kernel_size=12, activation='relu', padding='same', kernel_regularizer=keras.regularizers.l1(l1_reg)),
+        layers.MaxPooling1D(pool_size=2),
+        layers.Dropout(0.2),
+        layers.Conv1D(filters=64, kernel_size=12, activation='relu', padding='same', kernel_regularizer=keras.regularizers.l1(l1_reg)),
+        layers.MaxPooling1D(pool_size=2),
+        layers.Flatten(),
+        layers.Dense(50, activation='relu', kernel_regularizer=keras.regularizers.l1(l1_reg)),
+        layers.Dropout(0.3),
+        layers.Dense(1, activation='linear')
+    ])
+    model.compile(optimizer=keras.optimizers.Adam(0.001), loss='mse')
+    return model
+def build_cnn_l1l2(input_shape, l_reg=1e-5):
+    tf.keras.utils.set_random_seed(RANDOM_SEED)
+    model = keras.Sequential([
+        layers.Input(shape=input_shape),
+        layers.Conv1D(filters=32, kernel_size=12, activation='relu', padding='same', kernel_regularizer=keras.regularizers.l1_l2(l_reg, l_reg)),
+        layers.MaxPooling1D(pool_size=2),
+        layers.Dropout(0.2),
+        layers.Conv1D(filters=64, kernel_size=12, activation='relu', padding='same', kernel_regularizer=keras.regularizers.l1_l2(l_reg, l_reg)),
+        layers.MaxPooling1D(pool_size=2),
+        layers.Flatten(),
+        layers.Dense(50, activation='relu', kernel_regularizer=keras.regularizers.l1_l2(l_reg, l_reg)),
+        layers.Dropout(0.3),
+        layers.Dense(1, activation='linear')
+    ])
+    model.compile(optimizer=keras.optimizers.Adam(0.001), loss='mse')
+    return model
+def build_attentionnet(input_dim):
+    inp = layers.Input(shape=(input_dim,))
+    x = layers.Dense(512, activation='relu')(inp)
+    L = 16
+    if x.shape[-1] != L * 32:
+        x = layers.Dense(L * 32, activation='relu')(x)
+    proj = layers.Reshape((L, 32))(x)
+    att = layers.MultiHeadAttention(num_heads=4, key_dim=8)(proj, proj)
+    pooled = layers.GlobalAveragePooling1D()(att)
+    x = layers.Concatenate()([layers.Flatten()(x), pooled])
+    x = layers.Dense(128, activation='relu')(x)
+    out = layers.Dense(1)(x)
+    model = keras.Model(inp,out)
+    model.compile(optimizer=get_adamw(1e-3), loss='mse')
+    return model
+def build_epistatic_net_simplified(input_dim, l1_reg=1e-5, l2_reg=1e-4):
+    regularizer = keras.regularizers.l1_l2(l1=l1_reg, l2=l2_reg)
+    model = keras.Sequential([
+        layers.Input(shape=(input_dim,)),
+        layers.Dense(512, activation='relu', kernel_regularizer=regularizer),
+        layers.Dropout(0.3),
+        layers.Dense(256, activation='relu', kernel_regularizer=regularizer),
+        layers.Dropout(0.3),
+        layers.Dense(64, activation='relu'),
+        layers.Dense(1, activation='linear')
+    ])
+    model.compile(optimizer=get_adamw(1e-3), loss='mse')
+    return model
+def build_deepgs(input_shape):
+    model = keras.Sequential([
+        layers.Input(shape=input_shape),
+        layers.Conv1D(8, kernel_size=5, activation='relu', padding='same'),
+        layers.BatchNormalization(),
+        layers.MaxPooling1D(pool_size=2),
+        layers.Flatten(),
+        layers.Dense(32, activation='relu'),
+        layers.BatchNormalization(),
+        layers.Dense(1)
+    ])
+    model.compile(optimizer=get_adamw(1e-3), loss='mse')
+    return model
+def build_dgsn(input_dim):
+    model = keras.Sequential([
+        layers.Input(shape=(input_dim,)),
+        layers.Dense(512, activation='relu', kernel_regularizer=keras.regularizers.l1_l2(l1=1e-5, l2=1e-4)),
+        layers.Dropout(0.3),
+        layers.Dense(256, activation='relu', kernel_regularizer=keras.regularizers.l1_l2(l1=1e-5, l2=1e-4)),
+        layers.Dropout(0.3),
+        layers.Dense(64, activation='relu'),
+        layers.Dense(1, activation='linear')
+    ])
+    model.compile(optimizer=get_adamw(1e-3), loss='mse')
+    return model
+
+# -------------------------
+# TRAIN & EVAL helper (Adaptado para Y normalizado)
+# -------------------------
+def run_sklearn_model(name, model, Xtr, Ytr_norm, Xval, Yval_norm, Yval_orig, Y_scaler):
+    print(f"\n--- {name} ---")
+    t0 = time.time()
+    try:
+        model.fit(Xtr, Ytr_norm)
+        y_pred_norm = model.predict(Xval)
+        evaluate_and_store(name, y_pred_norm, Yval_norm, t0, Yval_orig, Y_scaler)
+    except Exception as e:
+        print(f"❌ Erro ao treinar/avaliar {name}: {e}")
+        error_metrics = {k: np.nan for k in ['Acurácia', 'Acurácia_std', 'Viés (b)', 'Viés (b)_std', 'RMSE', 'RMSE_std', 'RMSE (10% Melhores)', 'RMSE (10% Melhores)_std', 'Top10 Predito (média real)', 'Top10 Predito (média real)_std', 'Hit Rate (10% Coinc.)', 'Hit Rate (10% Coinc.)_std', 'NDCG', 'NDCG_std']}
+        results[name] = {**error_metrics, 'Tempo (s)': time.time() - t0, 'y_pred': np.full_like(Yval_orig, np.nan)}
+
+def run_keras_model(name, model, Xtr, Ytr_norm, Xval, Yval_norm, Yval_orig, Y_scaler, epochs=EPOCHS, batch_size=BATCH_SIZE):
+    print(f"\n--- {name} ---")
+    t0 = time.time()
+    try:
+        history = model.fit(Xtr, Ytr_norm, validation_data=(Xval,Yval_norm),
+                            epochs=epochs, batch_size=batch_size, verbose=0, callbacks=callbacks)
+
+        # Salva o gráfico de histórico de treino
+        plot_training_history(history, name, PLOTS_DIR)
+
+        y_pred_norm = model.predict(Xval).flatten()
+        evaluate_and_store(name, y_pred_norm, Yval_norm, t0, Yval_orig, Y_scaler)
+    except Exception as e:
+        print(f"❌ Erro ao treinar/avaliar {name}: {e}")
+        error_metrics = {k: np.nan for k in ['Acurácia', 'Acurácia_std', 'Viés (b)', 'Viés (b)_std', 'RMSE', 'RMSE_std', 'RMSE (10% Melhores)', 'RMSE (10% Melhores)_std', 'Top10 Predito (média real)', 'Top10 Predito (média real)_std', 'Hit Rate (10% Coinc.)', 'Hit Rate (10% Coinc.)_std', 'NDCG', 'NDCG_std']}
+        results[name] = {**error_metrics, 'Tempo (s)': time.time() - t0, 'y_pred': np.full_like(Yval_orig, np.nan)}
+
+# ===============================================================
+# Execução Principal (ORDEM FINAL)
+# ===============================================================
+
+# --- PRÉ-CALCULAÇÃO DOS KERNELS GENÔMICOS (G, D, I) E RKHS-RBF ---
+print("\n--- Pré-calculando Kernels Genômicos (G, D, I) e RKHS-RBF ---")
+G_train, D_train, I_train, den_sum, den_dom_val, W_scaled = calculate_genomic_matrices(X_train_scaled, X_train_raw)
+G_val, D_val, I_val = calculate_validation_kernels(X_val_scaled, X_val_raw, X_train_scaled, den_sum, den_dom_val, W_scaled)
+
+K_train_RBF, K_val_RBF = calculate_rbf_kernel(X_train_scaled, X_val_scaled)
+K_train_AD = K_train_RBF + D_train
+K_val_AD = K_val_RBF + D_val
+K_train_ADE = K_train_RBF + D_train + I_train
+K_val_ADE = K_val_RBF + D_val + I_val
+
+# ===============================================================
+# 38 MODELS EXECUTION
+# ===============================================================
+
+# 1. ELASTIC NET MOVIDO PARA O INÍCIO (OTIMIZADO)
+run_sklearn_model('Elastic Net', ElasticNetCV(l1_ratio=[.1, .5, .9, 1.0], cv=2, max_iter=10000, random_state=RANDOM_SEED, n_jobs=-1), X_train_scaled, Y_train_norm, X_val_scaled, Y_val_norm, Y_val_gv_orig, Y_scaler)
+
+# --- RKHS Models (SRMSE/RMSE baseados em Y_norm) ---
+run_rkhs_model('RKHS-RBF', K_train_RBF, K_val_RBF, Y_train_norm, Y_val_norm, Y_val_gv_orig, Y_scaler)
+run_rkhs_model('RKHS-AD', K_train_AD, K_val_AD, Y_train_norm, Y_val_norm, Y_val_gv_orig, Y_scaler)
+run_rkhs_model('RKHS-ADE', K_train_ADE, K_val_ADE, Y_train_norm, Y_val_norm, Y_val_gv_orig, Y_scaler)
+
+# --- Modelos Clássicos e Base ---
+run_sklearn_model('RidgeCV', RidgeCV(alphas=np.logspace(-3,3,100)), X_train_scaled, Y_train_norm, X_val_scaled, Y_val_norm, Y_val_gv_orig, Y_scaler)
+run_sklearn_model('Bayesian Ridge', BayesianRidge(), X_train_scaled, Y_train_norm, X_val_scaled, Y_val_norm, Y_val_gv_orig, Y_scaler)
+run_sklearn_model('LassoCV', LassoCV(cv=3, max_iter=10000, random_state=RANDOM_SEED, n_jobs=-1), X_train_scaled, Y_train_norm, X_val_scaled, Y_val_norm, Y_val_gv_orig, Y_scaler)
+run_sklearn_model('Linear Regression', LinearRegression(), X_train_scaled, Y_train_norm, X_val_scaled, Y_val_norm, Y_val_gv_orig, Y_scaler)
+run_sklearn_model('SVM-RBF', SVR(kernel='rbf'), X_train_scaled, Y_train_norm, X_val_scaled, Y_val_norm, Y_val_gv_orig, Y_scaler)
+run_sklearn_model('SVM-Poly', SVR(kernel='poly', degree=3), X_train_scaled, Y_train_norm, X_val_scaled, Y_val_norm, Y_val_gv_orig, Y_scaler)
+run_sklearn_model('KNN', KNeighborsRegressor(n_neighbors=10), X_train_scaled, Y_train_norm, X_val_scaled, Y_val_norm, Y_val_gv_orig, Y_scaler)
+
+# --- Ensemble e Boosting ---
+run_sklearn_model('Random Forest', RandomForestRegressor(n_estimators=200, random_state=RANDOM_SEED), X_train_scaled, Y_train_norm, X_val_scaled, Y_val_norm, Y_val_gv_orig, Y_scaler)
+run_sklearn_model('Extra Trees', ExtraTreesRegressor(n_estimators=200, random_state=RANDOM_SEED), X_train_scaled, Y_train_norm, X_val_scaled, Y_val_norm, Y_val_gv_orig, Y_scaler)
+run_sklearn_model('LightGBM', LGBMRegressor(random_state=RANDOM_SEED), X_train_scaled, Y_train_norm, X_val_scaled, Y_val_norm, Y_val_gv_orig, Y_scaler)
+run_sklearn_model('CatBoost', CatBoostRegressor(verbose=0, random_state=RANDOM_SEED), X_train_scaled, Y_train_norm, X_val_scaled, Y_val_norm, Y_val_gv_orig, Y_scaler)
+run_sklearn_model('XGBoost', xgb.XGBRegressor(random_state=RANDOM_SEED), X_train_scaled, Y_train_norm, X_val_scaled, Y_val_norm, Y_val_gv_orig, Y_scaler)
+run_sklearn_model('HistGradientBoosting', HistGradientBoostingRegressor(random_state=RANDOM_SEED), X_train_scaled, Y_train_norm, X_val_scaled, Y_val_norm, Y_val_gv_orig, Y_scaler)
+run_sklearn_model('GradientBoosting', GradientBoostingRegressor(random_state=RANDOM_SEED), X_train_scaled, Y_train_norm, X_val_scaled, Y_val_norm, Y_val_gv_orig, Y_scaler)
+
+# --- Deep Learning Base e Genômica Específica ---
+run_keras_model('DNN', build_dnn(n_markers), X_train_scaled, Y_train_norm, X_val_scaled, Y_val_norm, Y_val_gv_orig, Y_scaler)
+run_keras_model('CNN', build_cnn((n_markers, 1)), X_train_3d, Y_train_norm, X_val_3d, Y_val_norm, Y_val_gv_orig, Y_scaler)
+run_keras_model('DeepGS', build_deepgs((n_markers, 1)), X_train_3d, Y_train_norm, X_val_3d, Y_val_norm, Y_val_gv_orig, Y_scaler)
+run_keras_model('DGSN', build_dgsn(n_markers), X_train_scaled, Y_train_norm, X_val_scaled, Y_val_norm, Y_val_gv_orig, Y_scaler)
+run_keras_model('Epistatic Net (EN)', build_epistatic_net_simplified(n_markers), X_train_scaled, Y_train_norm, X_val_scaled, Y_val_norm, Y_val_gv_orig, Y_scaler)
+
+# --- Keras Models Esparsos L1/L2 ---
+run_keras_model('DNN-L1L2', build_dnn_l1l2(n_markers), X_train_scaled, Y_train_norm, X_val_scaled, Y_val_norm, Y_val_gv_orig, Y_scaler)
+run_keras_model('CNN-L1L2', build_cnn_l1l2(X_train_3d.shape[1:]), X_train_3d, Y_train_norm, X_val_3d, Y_val_norm, Y_val_gv_orig, Y_scaler)
+
+# --- Versões Esparsas L1 ---
+run_sklearn_model('LassoBayes', LassoCV(cv=5, random_state=RANDOM_SEED, max_iter=10000), X_train_scaled, Y_train_norm, X_val_scaled, Y_val_norm, Y_val_gv_orig, Y_scaler)
+run_sklearn_model('SVR-L1', LinearSVR(loss='squared_epsilon_insensitive', dual=False, max_iter=10000, random_state=RANDOM_SEED), X_train_scaled, Y_train_norm, X_val_scaled, Y_val_norm, Y_val_gv_orig, Y_scaler)
+run_keras_model('DNN-L1', build_dnn_l1(n_markers), X_train_scaled, Y_train_norm, X_val_scaled, Y_val_norm, Y_val_gv_orig, Y_scaler)
+run_keras_model('CNN-L1', build_cnn_l1(X_train_3d.shape[1:]), X_train_3d, Y_train_norm, X_val_3d, Y_val_norm, Y_val_gv_orig, Y_scaler)
+
+
+# ===============================================================
+# STACKING MODEL (Ajustado para Y normalizado)
+# ===============================================================
+
+print("\n" + "="*60)
+print("CONSTRUINDO STACKING MODEL - DNN-L1 + CatBoost")
+print("="*60)
+
+stacking_models = {
+    'DNN': build_dnn_l1(n_markers),
+    'CatBoost': CatBoostRegressor(verbose=0, random_state=RANDOM_SEED)
+}
+
+stacking_predictions_val_norm = []
+stacking_predictions_train_norm = []
+stacking_model_names = []
+trained_stacking_models = {}
+
+print("\nExecutando modelos selecionados para stacking...")
+
+# Re-executar/Coletar predições de validação (NORMALIZADAS)
+for name, model in stacking_models.items():
+    if name not in results or not isinstance(results[name].get('y_pred'), np.ndarray) or np.isnan(results[name].get('y_pred', [np.nan])).all():
+        print(f"\n--- Re-executando {name} para stacking ---")
+        if 'DNN' in name:
+            run_keras_model(name, model, X_train_scaled, Y_train_norm, X_val_scaled, Y_val_norm, Y_val_gv_orig, Y_scaler)
+        else:
+            run_sklearn_model(name, model, X_train_scaled, Y_train_norm, X_val_scaled, Y_val_norm, Y_val_gv_orig, Y_scaler)
+
+    # Coletar predições normalizadas (para Stacking)
+    try:
+        # Re-treinar para obter predições de TRAINO (NORMALIZADAS)
+        if name == 'DNN-L1':
+            model = build_dnn_l1(n_markers)
+            model.fit(X_train_scaled, Y_train_norm, epochs=EPOCHS, batch_size=BATCH_SIZE, verbose=0,
+                     callbacks=[EarlyStopping(patience=15, restore_best_weights=True)])
+            train_pred_norm = model.predict(X_train_scaled).flatten()
+            val_pred_norm = model.predict(X_val_scaled).flatten()
+        elif name == 'CatBoost':
+            model = CatBoostRegressor(verbose=0, random_state=RANDOM_SEED)
+            model.fit(X_train_scaled, Y_train_norm)
+            train_pred_norm = model.predict(X_train_scaled)
+            val_pred_norm = model.predict(X_val_scaled)
+
+        stacking_predictions_train_norm.append(train_pred_norm)
+        stacking_predictions_val_norm.append(val_pred_norm)
+        stacking_model_names.append(name)
+        print(f"✅ {name} treino: {len(train_pred_norm)} amostras")
+
+    except Exception as e:
+        print(f"❌ Erro {name} treino: {e}")
+        stacking_predictions_train_norm.append(np.full_like(Y_train_norm, np.nan))
+        stacking_predictions_val_norm.append(np.full_like(Y_val_norm, np.nan))
+
+# Execução do Meta-Learner (nos dados NORMALIZADOS)
+if len(stacking_predictions_train_norm) >= 2 and len(stacking_predictions_val_norm) >= 2:
+    stack_X_train = np.column_stack(stacking_predictions_train_norm)
+    stack_X_val = np.column_stack(stacking_predictions_val_norm)
+
+    imputer = SimpleImputer(strategy='mean')
+    stack_X_train = imputer.fit_transform(stack_X_train)
+    stack_X_val = imputer.transform(stack_X_val)
+
+    print("\n--- Stacking Model (DNN-L1 + CatBoost) ---")
+    start_time = time.time()
+
+    try:
+        meta_learner = LinearRegression()
+        meta_learner.fit(stack_X_train, Y_train_norm)
+        y_pred_stacking_norm = meta_learner.predict(stack_X_val)
+
+        # Avaliação usando predições normalizadas e valores originais
+        evaluate_and_store('Stacking', y_pred_stacking_norm, Y_val_norm, start_time, Y_val_gv_orig, Y_scaler)
+
+        # Correlação entre Modelos Base (usando predições normalizadas para diversidade)
+        corr_matrix_stack_val = np.corrcoef(np.column_stack(stacking_predictions_val_norm).T)
+        avg_correlation = np.mean(corr_matrix_stack_val[np.triu_indices_from(corr_matrix_stack_val, k=1)])
+        print(f"\n🎯 Diversidade do Ensemble (Correlação média normalizada): {avg_correlation:.4f}")
+
+    except Exception as e:
+        print(f"❌ Erro no Stacking Model: {e}")
+
+# --- Híbridos e Avançados (Ajustado para Y normalizado) ---
+print("\n--- LGBM + NN (hybrid) ---")
+t0 = time.time()
+try:
+    lgb_base = LGBMRegressor(n_estimators=400, random_state=RANDOM_SEED)
+    lgb_base.fit(X_train_scaled, Y_train_norm)
+    pred_base_val_norm = lgb_base.predict(X_val_scaled)
+    pred_base_train_norm = lgb_base.predict(X_train_scaled)
+    residuals_norm = Y_train_norm - pred_base_train_norm
+    nn_resid = keras.Sequential([
+        layers.Input(shape=(n_markers,)), layers.Dense(256, activation='relu'), layers.Dropout(0.3),
+        layers.Dense(64, activation='relu'), layers.Dense(1)
+    ])
+    nn_resid.compile(optimizer=get_adamw(1e-3), loss='mse')
+    nn_resid.fit(X_train_scaled, residuals_norm, epochs=60, batch_size=64, verbose=0, callbacks=callbacks)
+    pred_resid_val_norm = nn_resid.predict(X_val_scaled).flatten()
+    y_pred_avg_norm = pred_base_val_norm + pred_resid_val_norm
+    evaluate_and_store('LGBM+NN', y_pred_avg_norm, Y_val_norm, t0, Y_val_gv_orig, Y_scaler)
+except Exception as e:
+    print(f"❌ Erro ao treinar/avaliar LGBM+NN: {e}")
+    error_metrics = {k: np.nan for k in ['Acurácia', 'Acurácia_std', 'Viés (b)', 'Viés (b)_std', 'RMSE', 'RMSE_std', 'RMSE (10% Melhores)', 'RMSE (10% Melhores)_std', 'Top10 Predito (média real)', 'Top10 Predito (média real)_std', 'Hit Rate (10% Coinc.)', 'Hit Rate (10% Coinc.)_std', 'NDCG', 'NDCG_std']}
+    results['LGBM+NN'] = {**error_metrics, 'Tempo (s)': time.time() - t0, 'y_pred': np.full_like(Y_val_gv_orig, np.nan)}
+
+run_keras_model('MLP L1/L2', build_mlp_l1l2(n_markers), X_train_scaled, Y_train_norm, X_val_scaled, Y_val_norm, Y_val_gv_orig, Y_scaler)
+run_keras_model('AttentionNet', build_attentionnet(n_markers), X_train_scaled, Y_train_norm, X_val_scaled, Y_val_norm, Y_val_gv_orig, Y_scaler)
+
+# ===============================================================
+# Final results table & plots
+# ===============================================================
+
+metric_cols = [
+    'Acurácia', 'Acurácia_std',
+    'NDCG', 'NDCG_std',
+    'Hit Rate (10% Coinc.)', 'Hit Rate (10% Coinc.)_std',
+    'Viés (b)', 'Viés (b)_std',
+    'RMSE', 'RMSE_std',
+    'RMSE (10% Melhores)', 'RMSE (10% Melhores)_std',
+    'Top10 Predito (média real)', 'Top10 Predito (média real)_std',
+    'Tempo (s)'
+]
+all_cols = metric_cols + ['y_pred']
+
+df_results = pd.DataFrame.from_dict(results, orient='index')
+for col in all_cols:
+    if col not in df_results.columns:
+        df_results[col] = np.nan
+
+df_results = df_results[all_cols].round(4)
+df_results_print = df_results.drop(columns=['y_pred'], errors='ignore')
+df_results_print = df_results_print.sort_values(by='Acurácia', ascending=False)
+
+print("\n=== RESULTADOS FINAIS (com Erro Padrão do Bootstrap) ===")
+print(f"Total de Modelos Executados: {len(df_results_print)}")
+print(df_results_print)
+
+df_results.to_excel("resultados_38_modelos_StandardScaler_RKHS_SRMSE.xlsx")
+print("\n✅ Resultados salvos em 'resultados_38_modelos_StandardScaler_RKHS_SRMSE.xlsx'")
+
+# --- Visualizações Completas ---
+plt.style.use('seaborn-v0_8-whitegrid')
+fig, axes = plt.subplots(2, 3, figsize=(24, 16))
+
+order = df_results_print.index[:15]
+data_to_plot = df_results_print.loc[order]
+x_coords = np.arange(len(order))
+
+# Plot 1: Acurácia
+sns.barplot(x=order, y='Acurácia', data=data_to_plot, ax=axes[0,0], palette='viridis', dodge=False)
+y_values_acc = data_to_plot['Acurácia'].values
+y_errors_acc = data_to_plot['Acurácia_std'].values
+axes[0,0].errorbar(x=x_coords, y=y_values_acc, yerr=y_errors_acc, fmt='none', c='black', capsize=4, elinewidth=1)
+axes[0,0].set_title('Comparação de Acurácia (Pearson) - Top 15', fontsize=14, fontweight='bold')
+axes[0,0].tick_params(axis='x', rotation=45)
+axes[0,0].set_ylabel('Acurácia (Média Bootstrap)')
+
+# Plot 2: Hit Rate (Acurácia de Seleção)
+sns.barplot(x=order, y='Hit Rate (10% Coinc.)', data=data_to_plot, ax=axes[0,1], palette='plasma', dodge=False)
+y_values_hr = data_to_plot['Hit Rate (10% Coinc.)'].values
+y_errors_hr = data_to_plot['Hit Rate (10% Coinc.)_std'].values
+axes[0,1].errorbar(x=x_coords, y=y_values_hr, yerr=y_errors_hr, fmt='none', c='black', capsize=4, elinewidth=1)
+axes[0,1].set_title('Acurácia de Seleção (Hit Rate Top 10%) - Top 15', fontsize=14, fontweight='bold')
+axes[0,1].tick_params(axis='x', rotation=45)
+axes[0,1].set_ylabel('Hit Rate (Média Bootstrap)')
+
+# Plot 3: RMSE Geral (AGORA SRMSE)
+sns.barplot(x=order, y='RMSE', data=data_to_plot, ax=axes[0,2], palette='magma', dodge=False)
+y_values_rmse = data_to_plot['RMSE'].values
+y_errors_rmse = data_to_plot['RMSE_std'].values
+axes[0,2].errorbar(x=x_coords, y=y_values_rmse, yerr=y_errors_rmse, fmt='none', c='black', capsize=4, elinewidth=1)
+axes[0,2].set_title('SRMSE (Normalizado) - Top 15', fontsize=14, fontweight='bold')
+axes[0,2].tick_params(axis='x', rotation=45)
+axes[0,2].set_ylabel('SRMSE (Média Bootstrap)')
+
+# Plot 4: RMSE 10% Melhores (AGORA SRMSE 10%)
+sns.barplot(x=order, y='RMSE (10% Melhores)', data=data_to_plot, ax=axes[1,0], palette='cividis', dodge=False)
+y_values_rmse10 = data_to_plot['RMSE (10% Melhores)'].values
+y_errors_rmse10 = data_to_plot['RMSE (10% Melhores)_std'].values
+axes[1,0].errorbar(x=x_coords, y=y_values_rmse10, yerr=y_errors_rmse10, fmt='none', c='black', capsize=4, elinewidth=1)
+axes[1,0].set_title('SRMSE (10% Melhores, Normalizado) - Top 15', fontsize=14, fontweight='bold')
+axes[1,0].tick_params(axis='x', rotation=45)
+axes[1,0].set_ylabel('SRMSE Top 10% (Média Bootstrap)')
+
+# Plot 5: NDCG
+sns.barplot(x=order, y='NDCG', data=data_to_plot, ax=axes[1,1], palette='viridis', dodge=False)
+y_values_ndcg = data_to_plot['NDCG'].values
+y_errors_ndcg = data_to_plot['NDCG_std'].values
+axes[1,1].errorbar(x=x_coords, y=y_values_ndcg, yerr=y_errors_ndcg, fmt='none', c='black', capsize=4, elinewidth=1)
+axes[1,1].set_title('NDCG (Ganho Cumulativo Descontado Normalizado) - Top 15', fontsize=14, fontweight='bold')
+axes[1,1].tick_params(axis='x', rotation=45)
+axes[1,1].set_ylabel('NDCG (Média Bootstrap)')
+
+# Plot 6: Comparação de Tempos
+sns.barplot(x=order, y='Tempo (s)', data=data_to_plot, ax=axes[1,2], palette='rocket', dodge=False)
+axes[1,2].set_title('Tempo de Execução (segundos) - Top 15', fontsize=14, fontweight='bold')
+axes[1,2].tick_params(axis='x', rotation=45)
+axes[1,2].set_ylabel('Tempo (s)')
+
+plt.tight_layout(rect=[0, 0, 1, 0.96])
+plt.suptitle('ANÁLISE COMPARATIVA (Bootstrap) - RKHS-RBF/AD/ADE e Híbridos', fontsize=16, fontweight='bold')
+plt.show()
+
+# Gráficos de Correlação (Omitidos, mas permanecem no código original)
+
+print("\n🎯 PIPELINE CONCLUÍDO COM SRMSE (RMSE NORMALIZADO)!")
+
+# Compacta a pasta de gráficos
+print(f"\n📦 Compactando a pasta de gráficos '{PLOTS_DIR}'...")
+import shutil
+shutil.make_archive(PLOTS_DIR, 'zip', PLOTS_DIR)
+print(f"✅ Pasta compactada em '{PLOTS_DIR}.zip'")
